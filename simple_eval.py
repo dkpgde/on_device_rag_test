@@ -1,7 +1,7 @@
 import json
+import os
 import statistics
 import sys
-import os
 
 from rouge_score import rouge_scorer
 
@@ -15,7 +15,6 @@ def normalize_text(text):
 
 def get_key(item):
     c_id = item.get('conversation_id', 'unknown')
-    # Handle variations in turn key naming
     t_id = item.get('turn') or item.get('turn_id') or '0'
     return f"{c_id}_{t_id}"
 
@@ -44,7 +43,6 @@ def evaluate():
             except json.JSONDecodeError:
                 continue
 
-    # 2. Load Predictions
     print(f"Loading predictions from {PRED_FILE}...")
     if not os.path.exists(PRED_FILE):
         print(f"Error: {PRED_FILE} not found. Run the inference script first.")
@@ -53,7 +51,6 @@ def evaluate():
     with open(PRED_FILE, 'r', encoding='utf-8') as f:
         prediction_list = json.load(f)
 
-    # 3. Evaluate Intersection
     print(f"Evaluating valid predictions within the subset...")
     
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
@@ -71,7 +68,6 @@ def evaluate():
             skipped_errors += 1
             continue
         
-        # Ensure we have a ground truth for this prediction
         if key not in gold_map:
             continue
 
@@ -88,7 +84,6 @@ def evaluate():
         rouge_1_scores.append(scores['rouge1'].fmeasure)
         rouge_l_scores.append(scores['rougeL'].fmeasure)
 
-    # 4. Report Results
     if valid_samples == 0:
         print("\nWARNING: No valid samples found to evaluate.")
         print(f"Skipped {skipped_errors} items marked as 'Error' or empty.")
@@ -105,36 +100,27 @@ def evaluate():
     print(f"ROUGE-1:          {statistics.mean(rouge_1_scores):.4f} (Word Overlap)")
     print(f"ROUGE-L:          {statistics.mean(rouge_l_scores):.4f} (Sentence Structure)")
     print("="*30)
+    return prediction_list, gold_map
 
 if __name__ == "__main__":
-    evaluate()
+    predictions, gold_map = evaluate()
     
-    # Visual Inspection (unchanged logic, just safer keys)
     print(f" VISUAL INSPECTION (First {SHOW_COUNT} Valid Items) ")
     
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
-    
-    # Re-load for clean inspection logic or reuse variables if preferred
-    with open(PRED_FILE, 'r', encoding='utf-8') as f:
-        p_lines = json.load(f)
-    
-    gold_map_insp = {}
-    with open(GOLD_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            d = json.loads(line)
-            gold_map_insp[get_key(d)] = d.get('targets', [{}])[0].get('text', "")
 
+    # using count to handle errors and keyless entries
     count = 0
-    for pred in p_lines:
+    for pred in predictions:
         if count >= SHOW_COUNT: break
         
         key = get_key(pred)
         pred_text = pred.get('model_prediction', "")
         
         if not pred_text or pred_text == "Error": continue
-        if key not in gold_map_insp: continue
+        if key not in gold_map: continue
 
-        ref_text = gold_map_insp[key]
+        ref_text = gold_map[key]
         q_text = get_question_text(pred)
         
         scores = scorer.score(ref_text, pred_text)
