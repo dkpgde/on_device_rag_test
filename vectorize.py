@@ -1,62 +1,74 @@
-import json
 import os
-
+import shutil
+import pickle
 import chromadb
-import torch
+from beir.datasets.data_loader import GenericDataLoader
+from llama_index.core import Settings, VectorStoreIndex, StorageContext
+from llama_index.core.schema import TextNode
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.vector_stores.chroma import ChromaVectorStore
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
 
-HF_MODEL = "ibm-granite/granite-embedding-30m-english"
-CORPUS_PATH = "./data/cloud.jsonl"
-STORAGE_PATH = "./chroma_db"
-COLLECTION_NAME = "cloud_docs"
-BATCH_SIZE = 64
-
-def get_embeddings_hf(texts, model, tokenizer, device):
-    tokenized = tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(device)
-    with torch.no_grad():
-        output = model(**tokenized)
-        embeddings = output.last_hidden_state[:, 0]
-    normalized = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-    return normalized.cpu().numpy()
+# --- CONFIGURATION ---
+MODEL_NAME = "ibm/granite-embedding:30m"
+DATA_PATH = "./data"
+DB_PATH = "./chroma_db_nfcorpus_granite_30m"
+COLLECTION_NAME = "nfcorpus_granite"
+PERSIST_DIR = "./storage_nodes_nfcorpus_granite"
+NODES_FILE = os.path.join(PERSIST_DIR, "nodes.pkl")
 
 def main():
-    hf_model, hf_tokenizer, device = None, None, None
+    # 1. Clean previous DB to prevent ID conflicts
+    if os.path.exists(DB_PATH):
+        print(f"Deleting old DB at {DB_PATH}...")
+        shutil.rmtree(DB_PATH)
+    os.makedirs(DB_PATH, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    hf_tokenizer = AutoTokenizer.from_pretrained(HF_MODEL)
-    hf_model = AutoModel.from_pretrained(HF_MODEL).to(device)
-    hf_model.eval()
+    # 2. Setup Ollama Embedding
+    print(f"Initializing Ollama model: {MODEL_NAME}...")
+    embed_model = OllamaEmbedding(
+        model_name=MODEL_NAME,
+        base_url="http://localhost:11434",
+        ollama_additional_kwargs={"mirostat": 0}
+    )
+    Settings.embed_model = embed_model
 
-    os.makedirs(STORAGE_PATH, exist_ok=True)
-    client = chromadb.PersistentClient(path=STORAGE_PATH)
-    collection = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
-    print(f"Started ingestion: {CORPUS_PATH}")
-    batch_ids, batch_texts, batch_metadatas = [], [], []
+    # 3. Load Data
+    print(f"Loading data from {DATA_PATH}...")
+    corpus, _, _ = GenericDataLoader(data_folder=DATA_PATH).load(split="test")
 
-    try:
-        with open(CORPUS_PATH, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Processing"):
-                data = json.loads(line)
-                text_blob = f"Title: {data['title']}\n{data['text']}"
-                
-                batch_ids.append(data['_id'])
-                batch_texts.append(text_blob)
-                batch_metadatas.append({"title": data['title'], "original_text": data['text']})
+    # 4. Create Nodes (Preserving IDs)
+    print("Converting corpus to LlamaIndex Nodes...")
+    nodes = []
+    for doc_id, doc_data in tqdm(corpus.items()):
+        text = f"Title: {doc_data.get('title', '')}\n{doc_data.get('text', '')}"
+        # Critical: Explicitly set id_ to match BEIR doc_id
+        node = TextNode(text=text, id_=doc_id)
+        
+        # Optional: Save metadata for debugging
+        node.metadata = {"title": doc_data.get('title', '')}
+        nodes.append(node)
+    
+    # Save nodes for BM25 later
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+    with open(NODES_FILE, "wb") as f:
+        pickle.dump(nodes, f)
 
-                if len(batch_ids) >= BATCH_SIZE:
-                    embeddings = get_embeddings_hf(batch_texts, hf_model, hf_tokenizer, device)
-                    collection.add(ids=batch_ids, embeddings=embeddings, documents=batch_texts, metadatas=batch_metadatas)
-                    batch_ids, batch_texts, batch_metadatas = [], [], []
+    # 5. Ingest into Chroma via LlamaIndex
+    print("Ingesting into Chroma (this uses LlamaIndex's schema)...")
+    db = chromadb.PersistentClient(path=DB_PATH)
+    chroma_collection = db.create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-            if batch_ids:
-                embeddings = get_embeddings_hf(batch_texts, hf_model, hf_tokenizer, device)
-                collection.add(ids=batch_ids, embeddings=embeddings, documents=batch_texts, metadatas=batch_metadatas)
-
-        print(f"\nFinished ingestion. {collection.count()} documents stored.")
-
-    except FileNotFoundError:
-        print(f"File not found: {CORPUS_PATH}")
+    # This handles the embedding generation and correct metadata storage
+    VectorStoreIndex(
+        nodes, 
+        storage_context=storage_context, 
+        show_progress=True
+    )
+    
+    print(f"Ingestion complete. DB at {DB_PATH}")
 
 if __name__ == "__main__":
     main()
